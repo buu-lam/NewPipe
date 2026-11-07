@@ -9,6 +9,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.content.res.AppCompatResources
 import androidx.core.view.isVisible
 import kotlin.math.abs
+import kotlin.math.pow
+import kotlin.math.sign
 import org.schabi.newpipe.MainActivity
 import org.schabi.newpipe.R
 import org.schabi.newpipe.ktx.AnimationType
@@ -29,13 +31,25 @@ import org.schabi.newpipe.util.ThemeHelper.getAndroidDimenPx
 class MainPlayerGestureListener(
     private val playerUi: MainPlayerUi
 ) : BasePlayerGestureListener(playerUi), OnTouchListener {
-    private var isMoving = false
+
+    private enum class ScrollMode { NONE, VERTICAL, SEEK }
+
+    /** The kind of scroll gesture in progress, locked once the movement threshold is crossed. */
+    private var scrollMode = ScrollMode.NONE
+
+    /** Touch position, playback position and duration captured when a seek gesture starts. */
+    private var seekStartX = 0f
+    private var seekStartPositionMs = 0L
+    private var seekDurationMs = 0L
 
     override fun onTouch(v: View, event: MotionEvent): Boolean {
         super.onTouch(v, event)
-        if (event.action == MotionEvent.ACTION_UP && isMoving) {
-            isMoving = false
-            onScrollEnd(event)
+        if (scrollMode != ScrollMode.NONE) {
+            when (event.action) {
+                MotionEvent.ACTION_UP -> onScrollEnd(event)
+                // e.g. the system took over the gesture (back gesture): do not seek
+                MotionEvent.ACTION_CANCEL -> onScrollCancel()
+            }
         }
         return when (event.action) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
@@ -154,8 +168,107 @@ class MainPlayerGestureListener(
         binding.volumeRelativeLayout.isVisible = false
     }
 
+    // ///////////////////////////////////////////////////////////////////
+    // Horizontal swipe seeking (VLC-like)
+    // ///////////////////////////////////////////////////////////////////
+
+    private fun canSeek(): Boolean {
+        val exoPlayer = player.exoPlayer ?: return false
+        // duration is C.TIME_UNSET (negative) when unknown
+        return exoPlayer.isCurrentMediaItemSeekable && exoPlayer.duration > 0
+    }
+
+    private fun onSeekGestureStart(initialEvent: MotionEvent) {
+        val exoPlayer = player.exoPlayer
+        seekStartX = initialEvent.x
+        seekStartPositionMs = exoPlayer.currentPosition
+        seekDurationMs = exoPlayer.duration
+    }
+
+    private fun onScrollSeek(movingEvent: MotionEvent, totalDistanceX: Float) {
+        // A swipe that has not lasted FAST_SWIPE_MAX_DURATION yet may still be a quick swipe,
+        // which is only handled when the finger is lifted
+        if (movingEvent.eventTime - movingEvent.downTime < FAST_SWIPE_MAX_DURATION) {
+            return
+        }
+        showSeekText(formatScrubText(computeScrubOffset(totalDistanceX)))
+    }
+
+    private fun onSeekGestureEnd(event: MotionEvent, totalDistanceX: Float) {
+        if (event.eventTime - event.downTime < FAST_SWIPE_MAX_DURATION) {
+            // Quick swipe: fixed jump, same duration as double tap seeking
+            val seconds = PlayerHelper.retrieveSeekDurationFromPreferences(player) / 1000
+            if (totalDistanceX > 0) {
+                player.fastForward()
+                showSeekText("+${seconds}s")
+            } else {
+                player.fastRewind()
+                showSeekText("-${seconds}s")
+            }
+        } else {
+            // Slow swipe: jump proportional to the distance covered by the finger
+            val offset = computeScrubOffset(totalDistanceX)
+            if (offset != 0L) {
+                player.seekTo(seekStartPositionMs + offset)
+                player.triggerProgressUpdate()
+            }
+            showSeekText(formatScrubText(offset))
+        }
+        hideSeekText(SEEK_TEXT_HIDE_DELAY)
+    }
+
+    /**
+     * Same curve as VLC's horizontal seek gesture: about 3 seconds for a short swipe, growing
+     * with the fourth power of the distance up to 10 minutes for an 8 cm swipe. Movements
+     * shorter than 1 cm cancel the seek, so the user can come back to the start point to abort.
+     */
+    private fun computeScrubOffset(totalDistanceX: Float): Long {
+        val distanceCm = totalDistanceX / player.context.resources.displayMetrics.xdpi * 2.54f
+        if (abs(distanceCm) < 1f) {
+            return 0L
+        }
+        val offset = sign(distanceCm) * (600_000 * (distanceCm / 8.0).pow(4) + 3_000)
+        return offset.toLong().coerceIn(-seekStartPositionMs, seekDurationMs - seekStartPositionMs)
+    }
+
+    /** VLC-like display: `+0:15 (1:23)`, i.e. the offset followed by the target position. */
+    private fun formatScrubText(offsetMs: Long): String {
+        return (if (offsetMs >= 0) "+" else "-") +
+            PlayerHelper.getTimeString(abs(offsetMs)) +
+            " (" + PlayerHelper.getTimeString(seekStartPositionMs + offsetMs) + ")"
+    }
+
+    private fun showSeekText(text: String) {
+        val view = binding.gestureSeekTextView
+        view.text = text
+        // also cancels a pending hide animation from a previous swipe
+        view.animate(true, 100, AnimationType.SCALE_AND_ALPHA)
+        view.scaleX = 1f
+        view.scaleY = 1f
+    }
+
+    private fun hideSeekText(delay: Long) {
+        if (binding.gestureSeekTextView.isVisible) {
+            binding.gestureSeekTextView.animate(false, 200, AnimationType.SCALE_AND_ALPHA, delay)
+        }
+    }
+
     override fun onScrollEnd(event: MotionEvent) {
+        if (scrollMode == ScrollMode.SEEK) {
+            onSeekGestureEnd(event, event.x - seekStartX)
+        }
+        scrollMode = ScrollMode.NONE
         super.onScrollEnd(event)
+        hideVolumeAndBrightness()
+    }
+
+    private fun onScrollCancel() {
+        scrollMode = ScrollMode.NONE
+        hideSeekText(0)
+        hideVolumeAndBrightness()
+    }
+
+    private fun hideVolumeAndBrightness() {
         if (binding.volumeRelativeLayout.isVisible) {
             binding.volumeRelativeLayout.animate(false, 200, AnimationType.SCALE_AND_ALPHA, 200)
         }
@@ -185,15 +298,32 @@ class MainPlayerGestureListener(
             return false
         }
 
-        val insideThreshold = abs(movingEvent.y - initialEvent.y) <= MOVEMENT_THRESHOLD
-        if (
-            !isMoving && (insideThreshold || abs(distanceX) > abs(distanceY)) ||
-            player.currentState == Player.STATE_COMPLETED
-        ) {
+        if (player.currentState == Player.STATE_COMPLETED) {
             return false
         }
 
-        isMoving = true
+        val totalDistanceX = movingEvent.x - initialEvent.x
+        val totalDistanceY = movingEvent.y - initialEvent.y
+
+        if (scrollMode == ScrollMode.NONE) {
+            val isHorizontal = abs(totalDistanceX) > MOVEMENT_THRESHOLD &&
+                abs(totalDistanceX) > abs(totalDistanceY)
+            val isVertical = abs(totalDistanceY) > MOVEMENT_THRESHOLD &&
+                abs(distanceX) <= abs(distanceY)
+            scrollMode = when {
+                isHorizontal && !isDoubleTapping && canSeek() -> ScrollMode.SEEK
+                isVertical && !isHorizontal -> ScrollMode.VERTICAL
+                else -> return false
+            }
+            if (scrollMode == ScrollMode.SEEK) {
+                onSeekGestureStart(initialEvent)
+            }
+        }
+
+        if (scrollMode == ScrollMode.SEEK) {
+            onScrollSeek(movingEvent, totalDistanceX)
+            return true
+        }
 
         // -- Brightness and Volume control --
         if (getDisplayHalfPortion(initialEvent) == DisplayPortion.RIGHT_HALF) {
@@ -236,5 +366,9 @@ class MainPlayerGestureListener(
         private val TAG = MainPlayerGestureListener::class.java.simpleName
         private val DEBUG = MainActivity.DEBUG
         private const val MOVEMENT_THRESHOLD = 40
+
+        /** Swipes shorter than this are quick swipes (fixed jump), longer ones scrub. */
+        private const val FAST_SWIPE_MAX_DURATION = 1000L
+        private const val SEEK_TEXT_HIDE_DELAY = 500L
     }
 }
