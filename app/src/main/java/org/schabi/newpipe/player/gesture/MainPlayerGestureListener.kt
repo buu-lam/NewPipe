@@ -47,6 +47,7 @@ class MainPlayerGestureListener(
         if (scrollMode != ScrollMode.NONE) {
             when (event.action) {
                 MotionEvent.ACTION_UP -> onScrollEnd(event)
+
                 // e.g. the system took over the gesture (back gesture): do not seek
                 MotionEvent.ACTION_CANCEL -> onScrollCancel()
             }
